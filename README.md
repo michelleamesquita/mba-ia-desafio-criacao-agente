@@ -282,3 +282,128 @@ O README tem três seções. Arquitetura descreve cada agente, sua responsabilid
 A armadilha mais cara deste desafio é silenciosa: a rota de confirmações aceita a resposta, nenhum erro aparece e a ação não executa. A retomada só funciona quando a resposta chega ao agente que pediu a confirmação, e quem escolhe esse agente é o Runner. Nos nossos testes, nas versões 2.2.0 e 2.9.1, essa escolha mudou conforme a topologia dos agentes, os bloqueios de transferência, a configuração de retomada do App e o serviço de sessão, e uma combinação que funcionava em memória falhou com a sessão persistida. A página de confirmação de ações da documentação oficial diz que alguns serviços de sessão não são suportados, mas, nesses mesmos testes, a confirmação funcionou com sessão persistida em SQLite quando a resposta chegou ao agente certo. Por isso, teste a aprovação com a sessão persistida e depois de reiniciar a API, não só no adk web.
 
 Enquanto desenvolve, o adk web continua sendo o melhor lugar para ver transferências, chamadas de tool e pedidos de confirmação acontecendo. E a filosofia do desafio cabe numa frase: o modelo decide o caminho, o código decide o que é permitido.
+
+---
+
+# Solução implementada
+
+API em Python (FastAPI) com um assistente construído em Google ADK 2.9.1 (Gemini) para os moradores do Residencial Aurora: reservar áreas comuns, cancelar reservas, autorizar visitantes e tirar dúvidas do regulamento. As três seções abaixo (Arquitetura, Garantias e Como rodar) complementam o enunciado acima.
+
+Princípio do projeto: **o modelo decide o caminho, o código decide o que é permitido.**
+
+## Arquitetura
+
+```
+POST /sessoes/{id}/mensagens ─▶ Runner (ADK) ─▶ assistente (principal)
+                                                  ├─ sub_agent  reservas    ─ tools: listar_minhas_reservas, consultar_disponibilidade,
+                                                  │                                   reservar_area (confirma se há taxa), cancelar_reserva
+                                                  ├─ sub_agent  visitantes  ─ tools: listar_meus_visitantes, autorizar_visitante (sempre confirma)
+                                                  └─ AgentTool  regulamento ─ tools: ler_capitulo_regulamento, buscar_no_regulamento
+```
+
+| Agente | Responsabilidade | Como é acionado | Por quê |
+|---|---|---|---|
+| `assistente` (principal) | Entende o pedido e distribui. Não tem tools de dados e **não recebe o regulamento** nas instruções. | É o agente raiz do `App`. | Um único ponto de entrada para o morador. |
+| `reservas` | Disponibilidade, reservar, listar e cancelar reservas do próprio apartamento. | **Sub-agent** (`transfer_to_agent`). | Tem uma tool que pede confirmação. A confirmação só é retomada se a resposta chegar ao agente que a pediu; com sub-agent esse caminho é o suportado pelo Runner do ADK. |
+| `visitantes` | Autorizar e listar visitantes do próprio apartamento. | **Sub-agent** (`transfer_to_agent`). | Mesmo motivo: `autorizar_visitante` exige confirmação. |
+| `regulamento` | Responde dúvidas consultando o regulamento por capítulo/artigo. | **`AgentTool`** (chamado como tool). | É só consulta, sem confirmação. Como `AgentTool` roda numa sessão própria e efêmera, as chamadas de tool internas e os trechos lidos não entram no histórico do morador, só a resposta final. Isso mantém a conversa barata (Garantia 4). |
+
+Outras decisões:
+
+- **Especialistas só voltam ao principal** (`disallow_transfer_to_peers=True`). Não desligamos `disallow_transfer_to_parent`: com ele ligado, a aprovação da confirmação retorna 200 mas o ADK não retoma o especialista e a ação nunca executa (armadilha silenciosa descrita no enunciado; ver `app/agents.py`).
+- **`App` com `ResumabilityConfig(is_resumable=True)`** (`app/agents.py`): faz o Runner rotear a resposta da confirmação para o agente autor da chamada pendente.
+- **Sessões**: `DatabaseSessionService` sobre SQLite (`armazenamento/sessoes.db`). **Dados do condomínio**: SQLite separado (`armazenamento/condominio.db`), lido/gravado só por tools e pelas rotas de verificação. Sem serviço externo.
+- **Modelos**: `gemini-flash-lite-latest` por padrão para todos os agentes (foi o usado nos testes com a API real); configurável por variável de ambiente (ver "Como rodar"). Os modelos são criados com nova tentativa automática em 429/503 (`app/config.py`), porque o plano gratuito limita as requisições por minuto (por exemplo, 5/min no `gemini-2.5-flash` e 15/min no flash-lite); com limite baixo o fluxo completo fica lento, mas não falha. Erros do modelo viram 503 em JSON.
+- **Uma mensagem por vez por sessão** (`asyncio.Lock` por sessão em `app/service.py`), porque o ADK rejeita escritas concorrentes na mesma sessão.
+- **Mensagem enviada com confirmação pendente**: não chega ao modelo; a API devolve a pendência e pede a resposta pela rota de confirmações. Nada executa sem confirmação.
+
+## Garantias
+
+### 1. Cobrança ou acesso só com confirmação
+
+- `app/agents.py` (`FunctionTool(tools.reservar_area, require_confirmation=tools.reserva_exige_confirmacao)`): a regra "área com taxa > 0 gera cobrança" está em `reserva_exige_confirmacao` (`app/tools.py`), que consulta `dados/areas.json`, não o modelo.
+- `app/agents.py` (`FunctionTool(tools.autorizar_visitante, require_confirmation=True)`): autorizar visitante sempre confirma.
+- O ADK pausa a tool e emite `adk_request_confirmation`. `pendencias()` em `app/service.py` lê esses eventos da sessão e monta `confirmacoes_pendentes` (`id`, `acao`, `detalhes` normalizados pelo sistema).
+- `Servico.responder_confirmacao` (`app/service.py`) só aceita um `id` que esteja pendente **naquela sessão**; senão levanta `ConfirmacaoInexistente`, que vira **409** (`app/main.py`). Um `id` já respondido deixa de estar pendente, então o reenvio também dá 409. A resposta volta ao ADK como `FunctionResponse` de `adk_request_confirmation` com `{"confirmed": true|false}`, e o Runner retoma a tool: aprovar executa uma vez, negar retorna "rejected" sem gravar.
+- Não depende do modelo: "já estou confirmando aqui" no texto não cria nem dispensa pendência; a tool só executa quando o ADK recebe a `FunctionResponse` enviada pela rota.
+
+### 2. Cada sessão pertence a um apartamento
+
+- `Servico.criar_sessao` (`app/service.py`) grava `state={"apartamento": ...}` **uma única vez**, na criação; o vínculo também fica na tabela `sessoes` (`app/store.py`).
+- **Nenhuma tool recebe apartamento como parâmetro.** Todas leem `tool_context.state["apartamento"]` (`_apartamento` em `app/tools.py`); o modelo não tem como escolher outro. As consultas SQL sempre filtram por esse apartamento (`app/store.py`).
+- `_antes_da_ferramenta` (`app/agents.py`) bloqueia qualquer tool de especialista se a sessão não tiver apartamento.
+- `consultar_disponibilidade` e a recusa de reserva em data ocupada devolvem só `disponivel`/`indisponivel`, nunca o dono nem o código (`app/tools.py`, `app/agents.py`). Cancelar reserva de outro apartamento resulta em "não encontrada", sem revelar nada.
+- Reservar data ocupada é recusado **antes** de pedir confirmação (callback em `app/agents.py`).
+
+### 3. Nada se perde no reinício
+
+- Sessões e eventos: `DatabaseSessionService("sqlite+aiosqlite:///...")` em `app/service.py`. Reservas e visitantes: `app/store.py`.
+- `store.inicializar()` (chamado no `lifespan` de `app/main.py`) só cria o esquema e **só carrega `dados/*.json` na primeira execução** (marca `semeado` na tabela `meta`); nas subidas seguintes não toca nos dados.
+- Cancelamentos são `UPDATE status='cancelada'`, nunca `DELETE`, então também sobrevivem e seus códigos continuam reservados.
+
+### 4. O regulamento é consultado, não carregado
+
+- `app/regulamento.py` divide `dados/regulamento.md` em capítulos/artigos. As tools `ler_capitulo_regulamento` e `buscar_no_regulamento` (`app/tools.py`) devolvem **um único capítulo** (ou até 3 artigos de um só capítulo). O texto completo nunca vai ao modelo.
+- O agente principal não recebe o regulamento (`_instrucao_principal` em `app/agents.py`). O especialista `regulamento` recebe só o índice (números e títulos dos capítulos).
+- O especialista é `AgentTool` (`app/agents.py`): as leituras de capítulo acontecem numa sessão efêmera, e na sessão do morador entra só a resposta final, sem trechos de outros capítulos.
+
+### 5. Dois moradores, uma reserva
+
+- `app/store.py`: `CREATE UNIQUE INDEX ux_reserva_ativa ON reservas (area, data) WHERE status = 'ativa'`. A exclusividade é imposta pelo banco **no instante da gravação**.
+- `store.criar_reserva` faz o `INSERT` dentro de `BEGIN IMMEDIATE` e trata `sqlite3.IntegrityError`: quem perde recebe `None`, a tool devolve `status: "indisponivel"` e a API responde 200 normalmente, sem erro de servidor. A conferência prévia de disponibilidade é só cortesia (evita pedir confirmação à toa); a garantia é o índice.
+- Código da reserva: `RSV-{maior número já usado + 1}` calculado na mesma transação (`_proximo_codigo`), contando também as canceladas (nunca apagadas), e `codigo` é `PRIMARY KEY`. Nunca repete.
+
+## Como rodar
+
+### Pré-requisitos
+
+- Python 3.12+ e [uv](https://docs.astral.sh/uv/).
+- Uma chave do Google AI Studio.
+
+### Variáveis (`.env`)
+
+```bash
+cp .env.example .env   # e preencha GOOGLE_API_KEY
+```
+
+| Variável | Descrição |
+|---|---|
+| `GOOGLE_API_KEY` | Chave do Google AI Studio (obrigatória). |
+| `MODELO_PADRAO` | Modelo Gemini padrão de todos os agentes (opcional; padrão `gemini-flash-lite-latest`). |
+| `MODELO_PRINCIPAL`, `MODELO_RESERVAS`, `MODELO_VISITANTES`, `MODELO_REGULAMENTO` | Modelo de cada agente (opcionais). |
+| `ARMAZENAMENTO_DIR` | Pasta dos bancos SQLite (opcional; padrão `./armazenamento`). |
+
+O `.env` está no `.gitignore`; só o `.env.example` é versionado.
+
+### Comandos
+
+```bash
+uv sync                                          # instala as dependências
+uv run python -m app.restaurar                   # restaura os dados iniciais (reservas, visitantes) e apaga as sessões
+uv run uvicorn app.main:app --port 8000          # sobe a API em http://localhost:8000
+```
+
+- Não há serviço externo: os dois bancos são arquivos SQLite em `armazenamento/`.
+- O comando de restauração deve ser executado com a API parada. Ele volta reservas e visitantes ao estado de `dados/*.json` e também apaga as sessões.
+- Para reiniciar **sem** perder nada, pare a API (Ctrl+C) e suba de novo com o mesmo comando, sem rodar a restauração.
+
+### Verificação rápida
+
+```bash
+curl localhost:8000/apartamentos/101/reservas     # RSV-1377 (quadra, 2030-03-09)
+curl localhost:8000/apartamentos/302/visitantes   # Marina Duarte (2030-03-16)
+SID=$(curl -s -X POST localhost:8000/sessoes -H 'content-type: application/json' -d '{"apartamento":"101"}' | python -c 'import sys,json;print(json.load(sys.stdin)["session_id"])')
+curl -s -X POST localhost:8000/sessoes/$SID/mensagens -H 'content-type: application/json' -d '{"texto":"Reserve o salão de festas para 2030-04-20"}'
+```
+
+### Fluxo do avaliador contra a API real (opcional)
+
+Com a API no ar e os dados restaurados: `uv run python scripts/fluxo_avaliador.py --ate-12` executa os passos 1 a 12 e 14 e imprime `OK`/`FALHA`. Para o passo 13, reinicie a API e rode `uv run python scripts/fluxo_avaliador.py --pos-reinicio <S1> <nº de eventos>` (valores impressos no fim da primeira execução).
+
+### Simulação sem chave de API (opcional)
+
+`scripts/fluxo_com_modelo_falso.py` reproduz os passos do avaliador com um modelo roteirizado (`scripts/modelo_falso.py`), num diretório temporário. Valida o encanamento (confirmações, 409, reinício, disputa), não o comportamento do Gemini:
+
+```bash
+uv run python scripts/fluxo_com_modelo_falso.py
+```
